@@ -1,0 +1,443 @@
+const { USER_AGENTS } = require('../config/constants');
+const cheerio = require('cheerio');
+
+/**
+ * Sleep function for adding delays
+ * @param {number} ms - Milliseconds to sleep
+ * @returns {Promise} Promise that resolves after the specified time
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Get a random user agent from the predefined list
+ * @returns {string} Random user agent string
+ */
+const getRandomUserAgent = () => {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+};
+
+/**
+ * Generate browser-like headers for a given URL
+ * @param {string} url - Target URL
+ * @param {string} userAgent - User agent string
+ * @returns {object} Headers object
+ */
+const generateHeaders = (url, userAgent) => {
+  const urlObj = new URL(url);
+  const origin = `${urlObj.protocol}//${urlObj.hostname}`;
+  
+  return {
+    'User-Agent': userAgent,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Cache-Control': 'max-age=0',
+    'Referer': origin,
+    'Origin': origin
+  };
+};
+
+/**
+ * Format response in AWS Lambda style
+ * @param {number} statusCode - HTTP status code
+ * @param {object} data - Response data
+ * @param {object} headers - Response headers
+ * @param {number} attempt - Attempt number
+ * @returns {object} Lambda-formatted response
+ */
+const formatLambdaResponse = (statusCode, data, headers = {}, attempt = 1) => {
+  return {
+    statusCode,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      ...headers
+    },
+    body: JSON.stringify({
+      success: statusCode >= 200 && statusCode < 300,
+      data,
+      attempt,
+      timestamp: new Date().toISOString()
+    })
+  };
+};
+
+/**
+ * Calculate exponential backoff delay
+ * @param {number} attempt - Current attempt number (0-based)
+ * @returns {number} Delay in milliseconds
+ */
+const calculateBackoffDelay = (attempt) => {
+  const baseDelay = 1000; // 1 second
+  const maxDelay = 10000; // 10 seconds
+  const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+  return delay + Math.random() * 1000; // Add jitter
+};
+
+/**
+ * Extract logo and OG images from HTML content
+ * @param {string} html - HTML content to parse
+ * @param {string} baseUrl - Base URL for resolving relative URLs
+ * @returns {object} Object containing logo and OG image URLs
+ */
+const extractMetadata = (html, baseUrl) => {
+  const $ = cheerio.load(html);
+  const metadata = {
+    images: {
+      logo: null,
+      ogImage: null,
+      favicon: null,
+      appleTouchIcon: null
+    },
+    title: null,
+    description: null
+  };
+
+  try {
+    // Extract title
+    metadata.title = $('meta[property="og:title"]').attr('content') || 
+                    $('meta[name="og:title"]').attr('content') ||
+                    $('title').text() ||
+                    $('h1').first().text() ||
+                    null;
+
+    // Clean up title
+    if (metadata.title) {
+      metadata.title = metadata.title.trim();
+    }
+
+    // Extract description
+    metadata.description = $('meta[property="og:description"]').attr('content') || 
+                          $('meta[name="og:description"]').attr('content') ||
+                          $('meta[name="description"]').attr('content') ||
+                          $('meta[property="description"]').attr('content') ||
+                          null;
+
+    // Clean up description
+    if (metadata.description) {
+      metadata.description = metadata.description.trim();
+    }
+
+    // Extract Open Graph image
+    const ogImage = $('meta[property="og:image"]').attr('content') || 
+                   $('meta[name="og:image"]').attr('content');
+    if (ogImage) {
+      metadata.images.ogImage = resolveUrl(ogImage, baseUrl);
+    }
+
+    // Extract logo from common selectors
+    const logoSelectors = [
+      'img[alt*="logo" i]',
+      'img[class*="logo" i]',
+      'img[id*="logo" i]',
+      '.logo img',
+      '#logo img',
+      '[class*="brand"] img',
+      'header img:first-of-type',
+      '.navbar-brand img',
+      '.site-logo img'
+    ];
+
+    for (const selector of logoSelectors) {
+      const logoElement = $(selector).first();
+      if (logoElement.length && logoElement.attr('src')) {
+        metadata.images.logo = resolveUrl(logoElement.attr('src'), baseUrl);
+        break;
+      }
+    }
+
+    // Extract favicon
+    const favicon = $('link[rel="icon"]').attr('href') || 
+                   $('link[rel="shortcut icon"]').attr('href') ||
+                   $('link[rel="apple-touch-icon"]').attr('href');
+    if (favicon) {
+      metadata.images.favicon = resolveUrl(favicon, baseUrl);
+    }
+
+    // Extract Apple touch icon
+    const appleTouchIcon = $('link[rel="apple-touch-icon"]').attr('href') ||
+                          $('link[rel="apple-touch-icon-precomposed"]').attr('href');
+    if (appleTouchIcon) {
+      metadata.images.appleTouchIcon = resolveUrl(appleTouchIcon, baseUrl);
+    }
+
+    // If no logo found, try to use OG image as fallback
+    if (!metadata.images.logo && metadata.images.ogImage) {
+      metadata.images.logo = metadata.images.ogImage;
+    }
+
+    // If still no logo, try favicon as last resort
+    if (!metadata.images.logo && metadata.images.favicon) {
+      metadata.images.logo = metadata.images.favicon;
+    }
+
+  } catch (error) {
+    console.error('Error extracting metadata:', error.message);
+  }
+
+  return metadata;
+};
+
+// Keep the old function name for backward compatibility
+const extractImages = (html, baseUrl) => {
+  const metadata = extractMetadata(html, baseUrl);
+  return metadata.images;
+};
+
+/**
+ * Resolve relative URLs to absolute URLs
+ * @param {string} url - URL to resolve
+ * @param {string} baseUrl - Base URL for resolution
+ * @returns {string} Resolved absolute URL
+ */
+const resolveUrl = (url, baseUrl) => {
+  if (!url) return null;
+  
+  try {
+    // If already absolute URL, return as is
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      return url;
+    }
+    
+    // If protocol-relative URL
+    if (url.startsWith('//')) {
+      const baseUrlObj = new URL(baseUrl);
+      return `${baseUrlObj.protocol}${url}`;
+    }
+    
+    // Resolve relative URL
+    return new URL(url, baseUrl).href;
+  } catch (error) {
+    console.error('Error resolving URL:', error.message);
+    return null;
+  }
+};
+
+/**
+ * Check if response content is HTML
+ * @param {object} response - Axios response object
+ * @returns {boolean} True if content is HTML
+ */
+const isHtmlContent = (response) => {
+  const contentType = response.headers['content-type'] || '';
+  return contentType.includes('text/html');
+};
+
+/**
+ * Classify the type of link based on URL patterns and content analysis
+ * @param {string} url - The URL to classify
+ * @param {string} title - Page title (optional)
+ * @param {string} description - Page description (optional)
+ * @param {string} html - HTML content (optional)
+ * @returns {string} Link type: social, product, news, video, portfolio, blog, education, forum, other
+ */
+const classifyLinkType = (url, title = '', description = '', html = '') => {
+  if (!url) return 'other';
+  
+  const urlLower = url.toLowerCase();
+  const titleLower = title.toLowerCase();
+  const descriptionLower = description.toLowerCase();
+  const htmlLower = html.toLowerCase();
+  
+  // Social media platforms
+  const socialDomains = [
+    'facebook.com', 'twitter.com', 'x.com', 'instagram.com', 'linkedin.com',
+    'youtube.com', 'tiktok.com', 'snapchat.com', 'pinterest.com', 'reddit.com',
+    'discord.com', 'telegram.org', 'whatsapp.com', 'tumblr.com', 'flickr.com',
+    'vimeo.com', 'twitch.tv', 'clubhouse.com', 'mastodon.social'
+  ];
+  
+  // Video platforms
+  const videoDomains = [
+    'youtube.com', 'youtu.be', 'vimeo.com', 'dailymotion.com', 'twitch.tv',
+    'tiktok.com', 'vine.co', 'wistia.com', 'brightcove.com', 'jwplayer.com'
+  ];
+  
+  // News domains
+  const newsDomains = [
+    'cnn.com', 'bbc.com', 'reuters.com', 'ap.org', 'nytimes.com', 'wsj.com',
+    'guardian.com', 'washingtonpost.com', 'forbes.com', 'bloomberg.com',
+    'techcrunch.com', 'theverge.com', 'engadget.com', 'wired.com', 'ars-technica.com',
+    'news.com', 'newsweek.com', 'time.com', 'npr.org', 'abc.com', 'cbsnews.com'
+  ];
+  
+  // E-commerce/Product domains
+  const productDomains = [
+    'amazon.com', 'ebay.com', 'shopify.com', 'etsy.com', 'alibaba.com',
+    'walmart.com', 'target.com', 'bestbuy.com', 'apple.com/store', 'store.google.com',
+    'microsoft.com/store', 'nike.com', 'adidas.com', 'zalando.com', 'asos.com'
+  ];
+  
+  // Education domains
+  const educationDomains = [
+    'coursera.org', 'edx.org', 'udemy.com', 'khanacademy.org', 'mit.edu',
+    'harvard.edu', 'stanford.edu', 'berkeley.edu', 'udacity.com', 'pluralsight.com',
+    'lynda.com', 'skillshare.com', 'masterclass.com', 'codecademy.com'
+  ];
+  
+  // Forum domains
+  const forumDomains = [
+    'stackoverflow.com', 'stackexchange.com', 'quora.com', 'reddit.com',
+    'discourse.org', 'phpbb.com', 'vbulletin.com', 'xenforo.com', 'invision.com'
+  ];
+  
+  // Check domain-based classification
+  for (const domain of socialDomains) {
+    if (urlLower.includes(domain)) return 'social';
+  }
+  
+  for (const domain of videoDomains) {
+    if (urlLower.includes(domain)) return 'video';
+  }
+  
+  for (const domain of newsDomains) {
+    if (urlLower.includes(domain)) return 'news';
+  }
+  
+  for (const domain of productDomains) {
+    if (urlLower.includes(domain)) return 'product';
+  }
+  
+  for (const domain of educationDomains) {
+    if (urlLower.includes(domain)) return 'education';
+  }
+  
+  for (const domain of forumDomains) {
+    if (urlLower.includes(domain)) return 'forum';
+  }
+  
+  // URL pattern analysis
+  if (urlLower.includes('/shop') || urlLower.includes('/store') || urlLower.includes('/buy') || 
+      urlLower.includes('/product') || urlLower.includes('/cart') || urlLower.includes('/checkout')) {
+    return 'product';
+  }
+  
+  if (urlLower.includes('/blog') || urlLower.includes('/article') || urlLower.includes('/post')) {
+    return 'blog';
+  }
+  
+  if (urlLower.includes('/news') || urlLower.includes('/press') || urlLower.includes('/media')) {
+    return 'news';
+  }
+  
+  if (urlLower.includes('/video') || urlLower.includes('/watch') || urlLower.includes('/play')) {
+    return 'video';
+  }
+  
+  if (urlLower.includes('/portfolio') || urlLower.includes('/work') || urlLower.includes('/projects')) {
+    return 'portfolio';
+  }
+  
+  if (urlLower.includes('/course') || urlLower.includes('/learn') || urlLower.includes('/education') ||
+      urlLower.includes('/tutorial') || urlLower.includes('/training')) {
+    return 'education';
+  }
+  
+  if (urlLower.includes('/forum') || urlLower.includes('/discussion') || urlLower.includes('/community')) {
+    return 'forum';
+  }
+  
+  // Content-based analysis
+  const combinedContent = `${titleLower} ${descriptionLower}`;
+  
+  // Social indicators
+  if (combinedContent.includes('follow') || combinedContent.includes('connect') || 
+      combinedContent.includes('social') || combinedContent.includes('network') ||
+      combinedContent.includes('profile') || combinedContent.includes('posts')) {
+    return 'social';
+  }
+  
+  // Product indicators
+  if (combinedContent.includes('buy') || combinedContent.includes('price') || 
+      combinedContent.includes('shop') || combinedContent.includes('store') ||
+      combinedContent.includes('product') || combinedContent.includes('sale') ||
+      combinedContent.includes('discount') || combinedContent.includes('cart')) {
+    return 'product';
+  }
+  
+  // News indicators
+  if (combinedContent.includes('breaking') || combinedContent.includes('news') || 
+      combinedContent.includes('report') || combinedContent.includes('latest') ||
+      combinedContent.includes('update') || combinedContent.includes('headline')) {
+    return 'news';
+  }
+  
+  // Video indicators
+  if (combinedContent.includes('video') || combinedContent.includes('watch') || 
+      combinedContent.includes('play') || combinedContent.includes('stream') ||
+      combinedContent.includes('episode') || combinedContent.includes('movie')) {
+    return 'video';
+  }
+  
+  // Portfolio indicators
+  if (combinedContent.includes('portfolio') || combinedContent.includes('work') || 
+      combinedContent.includes('projects') || combinedContent.includes('showcase') ||
+      combinedContent.includes('gallery') || combinedContent.includes('design')) {
+    return 'portfolio';
+  }
+  
+  // Blog indicators
+  if (combinedContent.includes('blog') || combinedContent.includes('article') || 
+      combinedContent.includes('post') || combinedContent.includes('author') ||
+      combinedContent.includes('written') || combinedContent.includes('published')) {
+    return 'blog';
+  }
+  
+  // Education indicators
+  if (combinedContent.includes('course') || combinedContent.includes('learn') || 
+      combinedContent.includes('education') || combinedContent.includes('tutorial') ||
+      combinedContent.includes('training') || combinedContent.includes('lesson') ||
+      combinedContent.includes('study') || combinedContent.includes('university')) {
+    return 'education';
+  }
+  
+  // Forum indicators
+  if (combinedContent.includes('forum') || combinedContent.includes('discussion') || 
+      combinedContent.includes('community') || combinedContent.includes('question') ||
+      combinedContent.includes('answer') || combinedContent.includes('thread') ||
+      combinedContent.includes('reply') || combinedContent.includes('comment')) {
+    return 'forum';
+  }
+  
+  // HTML content analysis (if available)
+  if (html) {
+    if (htmlLower.includes('class="product"') || htmlLower.includes('add to cart') ||
+        htmlLower.includes('price') || htmlLower.includes('buy now')) {
+      return 'product';
+    }
+    
+    if (htmlLower.includes('video') || htmlLower.includes('<video') ||
+        htmlLower.includes('youtube') || htmlLower.includes('vimeo')) {
+      return 'video';
+    }
+    
+    if (htmlLower.includes('article') || htmlLower.includes('blog') ||
+        htmlLower.includes('post-content') || htmlLower.includes('entry-content')) {
+      return 'blog';
+    }
+  }
+  
+  return 'other';
+};
+
+module.exports = {
+  sleep,
+  getRandomUserAgent,
+  generateHeaders,
+  formatLambdaResponse,
+  calculateBackoffDelay,
+  extractImages,
+  extractMetadata,
+  resolveUrl,
+  isHtmlContent,
+  classifyLinkType
+};
